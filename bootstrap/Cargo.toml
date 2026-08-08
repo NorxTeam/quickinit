@@ -1,0 +1,20 @@
+[package]
+name = "nordix-quickinit-bootstrap"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-only"
+publish = false
+
+[[bin]]
+name = "nordix-quickinit"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

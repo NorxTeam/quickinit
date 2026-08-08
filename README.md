@@ -24,3 +24,9 @@ Run the host contract tests with:
 ~~~text
 cargo test --locked
 ~~~
+
+The freestanding bootstrap package is in [`bootstrap/`](bootstrap/). It is
+built by `toolchain/scripts/build-quickinit.py` for both supported targets and
+currently proves the bounded `write/getpid/wait/exit` handoff. It is not yet a
+full PID1 supervisor; the remaining kernel-backed process and filesystem
+contracts stay explicitly open in Roadmap 5.2.
