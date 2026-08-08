@@ -1,0 +1,36 @@
+schema = "gamma-recipe"
+schema_version = 1
+status = "staging"
+
+[package]
+name = "nordix-quickinit"
+version = "0.1.0"
+release = 1
+license = "GPL-3.0-only"
+abi = "norx-userspace-abi-v1"
+architectures = ["x86_64", "aarch64"]
+
+[source]
+kind = "git"
+repository = "https://github.com/NorxTeam/NordixQuickinit.git"
+subdir = "."
+
+[dependencies]
+build = ["nordix-toolchain = 0.1.0", "nordix-rust-userspace = 0.1.0"]
+
+[build]
+system = "cargo"
+command = "build"
+args = ["--locked", "--release"]
+network = false
+
+[targets.x86_64]
+triple = "x86_64-unknown-norx"
+
+[targets.aarch64]
+triple = "aarch64-unknown-norx"
+
+[[outputs]]
+name = "nordix-quickinit"
+kind = "service"
+paths = ["bin/quickinit", "cfg/quickinit"]
