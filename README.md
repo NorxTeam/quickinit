@@ -1,4 +1,4 @@
-# Nordix quickinit
+# quickinit
 
 quickinit is the planned first userspace process and service supervisor. The
 current 0.1 implementation is a host-testable policy core: it parses a strict
@@ -8,7 +8,7 @@ bounded sequence-numbered logs, and exposes a small control CLI grammar.
 
 The policy core deliberately has no host process execution and no hidden
 fallback to Linux paths. ProcessBackend is the narrow adapter that will bind
-the model to Nordix spawn, exec, wait, and signal syscalls when those ABI
+the model to the target's spawn, exec, wait, and signal syscalls when those ABI
 operations are available. Until then, the Roadmap 5.2 PID 1 and QEMU items
 remain open.
 

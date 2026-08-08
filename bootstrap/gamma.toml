@@ -1,5 +1,5 @@
 schema = "gamma-package"
-name = "nordix-quickinit-bootstrap"
+name = "quickinit-bootstrap"
 version = "0.1.0"
 kind = "userspace-bootstrap"
 license = "GPL-3.0-only"

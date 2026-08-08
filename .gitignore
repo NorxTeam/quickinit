@@ -1,3 +1,4 @@
 /target/
+/bootstrap/target/
 __pycache__/
 *.pyc

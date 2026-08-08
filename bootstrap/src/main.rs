@@ -8,11 +8,13 @@ const SYS_WAIT: u64 = 61;
 const SYS_EXIT: u64 = 60;
 const SYS_GETPID: u64 = 39;
 const SYS_WRITE: u64 = 1;
+const SYS_SPAWN: u64 = 400;
 const ECHILD: u64 = 10;
 
-const BOOTING: &[u8] = b"[quickinit] bootstrap entered\n";
-const READY: &[u8] = b"[quickinit] bootstrap ready; no children to reap\n";
-const FAILED: &[u8] = b"[quickinit] bootstrap contract failed\n";
+const BOOTING: &[u8] = b"[   OK   ] quickinit: bootstrap entered\n";
+const CHILD_PATH: &[u8] = b"/bin/rust-smoke";
+const READY: &[u8] = b"[   OK   ] quickinit: bootstrap ready; child reaped\n";
+const FAILED: &[u8] = b"[ FAILED ] quickinit: bootstrap contract failed\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -31,6 +33,16 @@ pub extern "C" fn _start() -> ! {
     if is_error(pid) || !is_error(wait_result) || wait_result != error(ECHILD) {
         write(2, FAILED);
         exit(2);
+    }
+
+    let child = syscall2(SYS_SPAWN, CHILD_PATH.as_ptr() as u64, CHILD_PATH.len() as u64);
+    if is_error(child) || child == 0 {
+        write(2, FAILED);
+        exit(4);
+    }
+    if syscall1(SYS_WAIT, child) != child {
+        write(2, FAILED);
+        exit(5);
     }
 
     if write(1, READY) != READY.len() {
@@ -117,6 +129,23 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
     result
 }
 
+#[cfg(target_arch = "x86_64")]
+fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
+    let result;
+    unsafe {
+        asm!(
+            "syscall",
+            inlateout("rax") number => result,
+            in("rdi") arg0,
+            in("rsi") arg1,
+            lateout("rcx") _,
+            lateout("r11") _,
+            options(nostack)
+        );
+    }
+    result
+}
+
 #[cfg(target_arch = "aarch64")]
 fn syscall0(number: u64) -> u64 {
     let result;
@@ -154,6 +183,21 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> u64 {
             inlateout("x0") arg0 => result,
             inlateout("x1") arg1 => _,
             inlateout("x2") arg2 => _,
+            in("x8") number,
+            options(nostack)
+        );
+    }
+    result
+}
+
+#[cfg(target_arch = "aarch64")]
+fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
+    let result;
+    unsafe {
+        asm!(
+            "svc 0",
+            inlateout("x0") arg0 => result,
+            in("x1") arg1,
             in("x8") number,
             options(nostack)
         );

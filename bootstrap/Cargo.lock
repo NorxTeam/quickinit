@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "nordix-quickinit-bootstrap"
+name = "quickinit-bootstrap"
 version = "0.1.0"

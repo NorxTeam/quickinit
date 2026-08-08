@@ -1,12 +1,12 @@
 [package]
-name = "nordix-quickinit-bootstrap"
+name = "quickinit-bootstrap"
 version = "0.1.0"
 edition = "2021"
 license = "GPL-3.0-only"
 publish = false
 
 [[bin]]
-name = "nordix-quickinit"
+name = "quickinit"
 path = "src/main.rs"
 test = false
 bench = false
