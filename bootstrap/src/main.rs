@@ -11,10 +11,12 @@ const SYS_WRITE: u64 = 1;
 const SYS_SPAWN: u64 = 400;
 const ECHILD: u64 = 10;
 
-const BOOTING: &[u8] = b"[   OK   ] quickinit: bootstrap entered\n";
+const BOOTING: &[u8] =
+    b"\x1b[90m[\x1b[0m\x1b[92m  OK  \x1b[0m\x1b[90m]\x1b[0m quickinit: bootstrap entered\n";
 const CHILD_PATH: &[u8] = b"/bin/rust-smoke";
-const READY: &[u8] = b"[   OK   ] quickinit: bootstrap ready; child reaped\n";
-const FAILED: &[u8] = b"[ FAILED ] quickinit: bootstrap contract failed\n";
+const READY: &[u8] = b"\x1b[90m[\x1b[0m\x1b[92m  OK  \x1b[0m\x1b[90m]\x1b[0m quickinit: bootstrap ready; child reaped\n";
+const FAIL: &[u8] =
+    b"\x1b[90m[\x1b[0m\x1b[91m FAIL \x1b[0m\x1b[90m]\x1b[0m quickinit: bootstrap contract failed\n";
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -24,29 +26,29 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     if write(1, BOOTING) != BOOTING.len() {
-        write(2, FAILED);
+        write(2, FAIL);
         exit(1);
     }
 
     let pid = getpid();
     let wait_result = syscall1(SYS_WAIT, 0);
-    if is_error(pid) || !is_error(wait_result) || wait_result != error(ECHILD) {
-        write(2, FAILED);
+    if is_error(pid) || pid != 1 || !is_error(wait_result) || wait_result != error(ECHILD) {
+        write(2, FAIL);
         exit(2);
     }
 
     let child = syscall2(SYS_SPAWN, CHILD_PATH.as_ptr() as u64, CHILD_PATH.len() as u64);
     if is_error(child) || child == 0 {
-        write(2, FAILED);
+        write(2, FAIL);
         exit(4);
     }
     if syscall1(SYS_WAIT, child) != child {
-        write(2, FAILED);
+        write(2, FAIL);
         exit(5);
     }
 
     if write(1, READY) != READY.len() {
-        write(2, FAILED);
+        write(2, FAIL);
         exit(3);
     }
     exit(0)
