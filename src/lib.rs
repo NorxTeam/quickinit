@@ -7,6 +7,28 @@ pub const MAX_LOG_RETENTION: usize = 4096;
 pub const DEFAULT_SHUTDOWN_TIMEOUT_MS: u64 = 5_000;
 pub const MAX_SHUTDOWN_TIMEOUT_MS: u64 = 3_600_000;
 pub const MAX_SERVICE_TIMEOUT_MS: u64 = 3_600_000;
+pub const MAX_CONFIG_BYTES: usize = 64 * 1024;
+pub const MAX_CONFIG_LINES: usize = 1024;
+pub const MAX_CONFIG_LINE_BYTES: usize = 4096;
+pub const MAX_CONFIG_KEYS: usize = MAX_CONFIG_LINES;
+pub const MAX_CONFIG_STRING_BYTES: usize = 2048;
+pub const MAX_CONFIG_ALLOCATED_BYTES: usize = 256 * 1024;
+pub const MAX_SERVICES: usize = 128;
+pub const MAX_SERVICE_NAME_BYTES: usize = 64;
+pub const MAX_GLOBAL_ENV_ENTRIES: usize = 64;
+pub const MAX_SERVICE_ENV_ENTRIES: usize = 128;
+pub const MAX_TOTAL_ENV_ENTRIES: usize = 4096;
+pub const MAX_ENV_NAME_BYTES: usize = 64;
+pub const MAX_ARRAY_ITEMS: usize = 64;
+pub const MAX_ARRAY_BYTES: usize = 16 * 1024;
+pub const MAX_TOTAL_ARRAY_ITEMS: usize = 1024;
+pub const MAX_ARGUMENTS: usize = 64;
+pub const MAX_ARGUMENT_BYTES: usize = 8 * 1024;
+pub const MAX_ARGUMENT_BYTES_PER_ITEM: usize = 1024;
+pub const MAX_DEPENDENCIES: usize = 32;
+pub const MAX_CAPABILITIES: usize = 6;
+pub const MAX_CAPABILITY_NAME_BYTES: usize = 16;
+pub const MAX_BOOT_SERVICES: usize = 32;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
@@ -15,8 +37,18 @@ pub enum ConfigError {
     DuplicateKey(String),
     InvalidValue(String),
     MissingValue(String),
-    UnknownService { context: String, service: String },
-    UnknownDependency { service: String, dependency: String },
+    LimitExceeded {
+        resource: &'static str,
+        limit: usize,
+    },
+    UnknownService {
+        context: String,
+        service: String,
+    },
+    UnknownDependency {
+        service: String,
+        dependency: String,
+    },
     DependencyCycle(String),
 }
 
@@ -28,6 +60,9 @@ impl fmt::Display for ConfigError {
             Self::DuplicateKey(key) => write!(formatter, "duplicate config key: {key}"),
             Self::InvalidValue(value) => write!(formatter, "invalid config value: {value}"),
             Self::MissingValue(key) => write!(formatter, "missing config value: {key}"),
+            Self::LimitExceeded { resource, limit } => {
+                write!(formatter, "config {resource} exceeds limit {limit}")
+            }
             Self::UnknownService { context, service } => {
                 write!(formatter, "{context} references unknown service {service}")
             }
@@ -46,6 +81,87 @@ impl fmt::Display for ConfigError {
 }
 
 impl std::error::Error for ConfigError {}
+
+#[derive(Default)]
+struct ConfigBudget {
+    allocated_bytes: usize,
+    keys: usize,
+    services: usize,
+    env_entries: usize,
+    array_items: usize,
+}
+
+impl ConfigBudget {
+    fn reserve_bytes(&mut self, amount: usize, resource: &'static str) -> Result<(), ConfigError> {
+        let next = self
+            .allocated_bytes
+            .checked_add(amount)
+            .ok_or(ConfigError::LimitExceeded {
+                resource: "parsed string bytes",
+                limit: MAX_CONFIG_ALLOCATED_BYTES,
+            })?;
+        if next > MAX_CONFIG_ALLOCATED_BYTES {
+            return Err(ConfigError::LimitExceeded {
+                resource,
+                limit: MAX_CONFIG_ALLOCATED_BYTES,
+            });
+        }
+        self.allocated_bytes = next;
+        Ok(())
+    }
+
+    fn reserve_count(
+        count: &mut usize,
+        amount: usize,
+        maximum: usize,
+        resource: &'static str,
+    ) -> Result<(), ConfigError> {
+        let next = count
+            .checked_add(amount)
+            .ok_or(ConfigError::LimitExceeded {
+                resource,
+                limit: maximum,
+            })?;
+        if next > maximum {
+            return Err(ConfigError::LimitExceeded {
+                resource,
+                limit: maximum,
+            });
+        }
+        *count = next;
+        Ok(())
+    }
+
+    fn reserve_key(&mut self, bytes: usize) -> Result<(), ConfigError> {
+        Self::reserve_count(&mut self.keys, 1, MAX_CONFIG_KEYS, "config keys")?;
+        self.reserve_bytes(bytes, "parsed string bytes")
+    }
+
+    fn reserve_service(&mut self, bytes: usize) -> Result<(), ConfigError> {
+        Self::reserve_count(&mut self.services, 1, MAX_SERVICES, "services")?;
+        self.reserve_bytes(bytes, "parsed string bytes")
+    }
+
+    fn reserve_env_entry(&mut self, bytes: usize) -> Result<(), ConfigError> {
+        Self::reserve_count(
+            &mut self.env_entries,
+            1,
+            MAX_TOTAL_ENV_ENTRIES,
+            "environment entries",
+        )?;
+        self.reserve_bytes(bytes, "parsed string bytes")
+    }
+
+    fn reserve_array(&mut self, count: usize, bytes: usize) -> Result<(), ConfigError> {
+        Self::reserve_count(
+            &mut self.array_items,
+            count,
+            MAX_TOTAL_ARRAY_ITEMS,
+            "array items",
+        )?;
+        self.reserve_bytes(bytes, "parsed string bytes")
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryMode {
@@ -99,6 +215,19 @@ pub enum TimeoutAction {
 enum StopReason {
     Manual,
     Timeout,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopPhase {
+    Graceful { deadline_ms: u64 },
+    KillSent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopRequest {
+    reason: StopReason,
+    phase: StopPhase,
+    restart_after_reap: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -204,7 +333,15 @@ pub struct InitConfig {
 }
 
 pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
-    let mut section = String::from("init");
+    if source.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "source bytes",
+            limit: MAX_CONFIG_BYTES,
+        });
+    }
+
+    let mut budget = ConfigBudget::default();
+    let mut section = "init";
     let mut seen = BTreeSet::new();
     let mut version = None;
     let mut recovery = None;
@@ -219,7 +356,19 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
     let mut boot = BootConfig::default();
     let mut services = BTreeMap::<String, ServiceConfig>::new();
 
-    for raw_line in source.lines() {
+    for (line_number, raw_line) in source.lines().enumerate() {
+        if line_number >= MAX_CONFIG_LINES {
+            return Err(ConfigError::LimitExceeded {
+                resource: "source lines",
+                limit: MAX_CONFIG_LINES,
+            });
+        }
+        if raw_line.len() > MAX_CONFIG_LINE_BYTES {
+            return Err(ConfigError::LimitExceeded {
+                resource: "source line bytes",
+                limit: MAX_CONFIG_LINE_BYTES,
+            });
+        }
         let line = raw_line.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
@@ -228,7 +377,7 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
             if !line.ends_with(']') {
                 return Err(ConfigError::InvalidLine(line.to_owned()));
             }
-            section = line[1..line.len() - 1].trim().to_owned();
+            section = line[1..line.len() - 1].trim();
             if section != "init"
                 && section != "logging"
                 && section != "env"
@@ -249,9 +398,10 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                         return Err(ConfigError::InvalidLine(line.to_owned()));
                     }
                 }
-                services
-                    .entry(name.to_owned())
-                    .or_insert_with(default_service);
+                if !services.contains_key(name) {
+                    budget.reserve_service(name.len() + 1)?;
+                    services.insert(name.to_owned(), default_service());
+                }
             }
             continue;
         }
@@ -264,16 +414,25 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
         if key.is_empty() {
             return Err(ConfigError::InvalidLine(line.to_owned()));
         }
+        let full_key_len = section
+            .len()
+            .checked_add(1)
+            .and_then(|length| length.checked_add(key.len()))
+            .ok_or(ConfigError::LimitExceeded {
+                resource: "config keys",
+                limit: MAX_CONFIG_KEYS,
+            })?;
+        budget.reserve_key(full_key_len)?;
         let full_key = format!("{section}.{key}");
         if !seen.insert(full_key) {
             return Err(ConfigError::DuplicateKey(key.to_owned()));
         }
 
-        match section.as_str() {
+        match section {
             "init" => match key {
                 "version" => version = Some(parse_u32(value)?),
                 "recovery" => {
-                    recovery = Some(match parse_string(value)?.as_str() {
+                    recovery = Some(match parse_string_ref(value)? {
                         "halt" => RecoveryMode::Halt,
                         "shell" => RecoveryMode::Shell,
                         other => {
@@ -285,10 +444,12 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
             },
             "logging" => match key {
                 "level" => {
-                    logging.level = parse_log_level(&parse_string(value)?)?;
+                    logging.level = parse_log_level(parse_string_ref(value)?)?;
                 }
                 "retention" => {
-                    let retention = parse_u64(value)? as usize;
+                    let retention =
+                        parse_bounded_u64(value, "logging.retention", MAX_LOG_RETENTION as u64)?
+                            as usize;
                     if retention == 0 || retention > MAX_LOG_RETENTION {
                         return Err(ConfigError::InvalidValue(format!("retention={retention}")));
                     }
@@ -296,7 +457,7 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                 }
                 "serial_fallback" => logging.serial_fallback = parse_bool(value)?,
                 "on_storage_unavailable" => {
-                    logging.on_storage_unavailable = match parse_string(value)?.as_str() {
+                    logging.on_storage_unavailable = match parse_string_ref(value)? {
                         "serial" => StorageFailureAction::Serial,
                         "continue" => StorageFailureAction::Continue,
                         "halt" => StorageFailureAction::Halt,
@@ -310,19 +471,64 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                 _ => return Err(ConfigError::UnknownKey(key.to_owned())),
             },
             "boot" => match key {
-                "shell" => boot.shell = Some(parse_string(value)?),
-                "recovery_shell" => boot.recovery_shell = Some(parse_string(value)?),
-                "mounts" => boot.mounts = parse_array(value)?,
-                "devices" => boot.devices = parse_array(value)?,
-                "logging" => boot.logging = parse_array(value)?,
+                "shell" => {
+                    let shell = parse_string_ref(value)?;
+                    validate_name(shell)?;
+                    budget.reserve_bytes(shell.len(), "parsed string bytes")?;
+                    boot.shell = Some(shell.to_owned());
+                }
+                "recovery_shell" => {
+                    let shell = parse_string_ref(value)?;
+                    validate_name(shell)?;
+                    budget.reserve_bytes(shell.len(), "parsed string bytes")?;
+                    boot.recovery_shell = Some(shell.to_owned());
+                }
+                "mounts" => {
+                    boot.mounts = parse_array(
+                        value,
+                        &mut budget,
+                        MAX_BOOT_SERVICES,
+                        MAX_ARRAY_BYTES,
+                        MAX_SERVICE_NAME_BYTES,
+                        validate_name,
+                    )?;
+                }
+                "devices" => {
+                    boot.devices = parse_array(
+                        value,
+                        &mut budget,
+                        MAX_BOOT_SERVICES,
+                        MAX_ARRAY_BYTES,
+                        MAX_SERVICE_NAME_BYTES,
+                        validate_name,
+                    )?;
+                }
+                "logging" => {
+                    boot.logging = parse_array(
+                        value,
+                        &mut budget,
+                        MAX_BOOT_SERVICES,
+                        MAX_ARRAY_BYTES,
+                        MAX_SERVICE_NAME_BYTES,
+                        validate_name,
+                    )?;
+                }
                 _ => return Err(ConfigError::UnknownKey(key.to_owned())),
             },
             "env" => {
                 validate_env_name(key)?;
-                environment.insert(key.to_owned(), parse_string(value)?);
+                if environment.len() >= MAX_GLOBAL_ENV_ENTRIES {
+                    return Err(ConfigError::LimitExceeded {
+                        resource: "global environment entries",
+                        limit: MAX_GLOBAL_ENV_ENTRIES,
+                    });
+                }
+                let value = parse_string_ref(value)?;
+                budget.reserve_env_entry(key.len() + value.len())?;
+                environment.insert(key.to_owned(), value.to_owned());
             }
             "shutdown" => match key {
-                "signal" => shutdown.signal = parse_signal(&parse_string(value)?)?,
+                "signal" => shutdown.signal = parse_signal(parse_string_ref(value)?)?,
                 "timeout_ms" => {
                     shutdown.timeout_ms = parse_positive_bounded_u64(
                         value,
@@ -331,7 +537,7 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                     )?;
                 }
                 "on_timeout" => {
-                    shutdown.on_timeout = match parse_string(value)?.as_str() {
+                    shutdown.on_timeout = match parse_string_ref(value)? {
                         "kill" => ShutdownTimeoutAction::Kill,
                         "halt" => ShutdownTimeoutAction::Halt,
                         other => {
@@ -359,14 +565,33 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                 }
                 let config = services
                     .get_mut(service)
-                    .ok_or_else(|| ConfigError::InvalidLine(section.clone()))?;
+                    .ok_or_else(|| ConfigError::InvalidLine(section.to_owned()))?;
                 match subsection {
                     None => match key {
-                        "command" => config.command = parse_string(value)?,
-                        "args" => config.args = parse_array(value)?,
-                        "workdir" => config.workdir = parse_string(value)?,
+                        "command" => {
+                            let command = parse_string_ref(value)?;
+                            validate_path(command, "service.command")?;
+                            budget.reserve_bytes(command.len(), "parsed string bytes")?;
+                            config.command = command.to_owned();
+                        }
+                        "args" => {
+                            config.args = parse_array(
+                                value,
+                                &mut budget,
+                                MAX_ARGUMENTS,
+                                MAX_ARGUMENT_BYTES,
+                                MAX_ARGUMENT_BYTES_PER_ITEM,
+                                validate_any_array_item,
+                            )?;
+                        }
+                        "workdir" => {
+                            let workdir = parse_string_ref(value)?;
+                            validate_path(workdir, "service.workdir")?;
+                            budget.reserve_bytes(workdir.len(), "parsed string bytes")?;
+                            config.workdir = workdir.to_owned();
+                        }
                         "mode" => {
-                            config.mode = match parse_string(value)?.as_str() {
+                            config.mode = match parse_string_ref(value)? {
                                 "foreground" => ServiceMode::Foreground,
                                 "background" => ServiceMode::Background,
                                 other => {
@@ -377,7 +602,7 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                             };
                         }
                         "kind" => {
-                            config.kind = match parse_string(value)?.as_str() {
+                            config.kind = match parse_string_ref(value)? {
                                 "service" => ServiceKind::Service,
                                 "daemon" => ServiceKind::Daemon,
                                 "oneshot" => ServiceKind::Oneshot,
@@ -389,13 +614,22 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                             };
                         }
                         "autostart" => config.autostart = parse_bool(value)?,
-                        "stdin" => config.stdin = parse_stream(value)?,
-                        "stdout" => config.stdout = parse_stream(value)?,
-                        "stderr" => config.stderr = parse_stream(value)?,
-                        "dependencies" => config.dependencies = parse_array(value)?,
+                        "stdin" => config.stdin = parse_stream(value, &mut budget)?,
+                        "stdout" => config.stdout = parse_stream(value, &mut budget)?,
+                        "stderr" => config.stderr = parse_stream(value, &mut budget)?,
+                        "dependencies" => {
+                            config.dependencies = parse_array(
+                                value,
+                                &mut budget,
+                                MAX_DEPENDENCIES,
+                                MAX_ARRAY_BYTES,
+                                MAX_SERVICE_NAME_BYTES,
+                                validate_name,
+                            )?;
+                        }
                         "order" => config.order = parse_u32(value)?,
                         "restart" => {
-                            config.restart = match parse_string(value)?.as_str() {
+                            config.restart = match parse_string_ref(value)? {
                                 "never" => RestartPolicy::Never,
                                 "on-failure" => RestartPolicy::OnFailure,
                                 "always" => RestartPolicy::Always,
@@ -421,10 +655,14 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                                 MAX_SERVICE_TIMEOUT_MS,
                             )?;
                         }
-                        "stop_signal" => config.stop_signal = parse_signal(&parse_string(value)?)?,
-                        "kill_signal" => config.kill_signal = parse_signal(&parse_string(value)?)?,
+                        "stop_signal" => {
+                            config.stop_signal = parse_signal(parse_string_ref(value)?)?
+                        }
+                        "kill_signal" => {
+                            config.kill_signal = parse_signal(parse_string_ref(value)?)?
+                        }
                         "timeout_action" => {
-                            config.timeout_action = match parse_string(value)?.as_str() {
+                            config.timeout_action = match parse_string_ref(value)? {
                                 "restart" => TimeoutAction::Restart,
                                 "fail" => TimeoutAction::Fail,
                                 "stop" => TimeoutAction::Stop,
@@ -436,7 +674,7 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                             };
                         }
                         "readiness" => {
-                            config.readiness = match parse_string(value)?.as_str() {
+                            config.readiness = match parse_string_ref(value)? {
                                 "spawn" => Readiness::Spawn,
                                 "notify" => Readiness::Notify,
                                 other => {
@@ -453,14 +691,29 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
                                 MAX_SERVICE_TIMEOUT_MS,
                             )?;
                         }
-                        "capabilities" => config.capabilities = parse_array(value)?,
+                        "capabilities" => {
+                            config.capabilities = parse_array(
+                                value,
+                                &mut budget,
+                                MAX_CAPABILITIES,
+                                MAX_ARRAY_BYTES,
+                                MAX_CAPABILITY_NAME_BYTES,
+                                validate_capability_name,
+                            )?;
+                        }
                         _ => return Err(ConfigError::UnknownKey(format!("{service}.{key}"))),
                     },
                     Some("env") => {
                         validate_env_name(key)?;
-                        config
-                            .environment
-                            .insert(key.to_owned(), parse_string(value)?);
+                        let value = parse_string_ref(value)?;
+                        if config.environment.len() >= MAX_SERVICE_ENV_ENTRIES {
+                            return Err(ConfigError::LimitExceeded {
+                                resource: "service environment entries",
+                                limit: MAX_SERVICE_ENV_ENTRIES,
+                            });
+                        }
+                        budget.reserve_env_entry(key.len() + value.len())?;
+                        config.environment.insert(key.to_owned(), value.to_owned());
                     }
                     Some("limits") => match key {
                         "cpu_time_ms" => {
@@ -520,12 +773,50 @@ pub fn parse_config(source: &str) -> Result<InitConfig, ConfigError> {
             }
         }
     }
+    let mut inherited_entries = 0usize;
+    let mut inherited_bytes = 0usize;
+    for service in services.values() {
+        let missing = environment
+            .keys()
+            .filter(|key| !service.environment.contains_key(*key))
+            .count();
+        if service.environment.len() + missing > MAX_SERVICE_ENV_ENTRIES {
+            return Err(ConfigError::LimitExceeded {
+                resource: "service environment entries",
+                limit: MAX_SERVICE_ENV_ENTRIES,
+            });
+        }
+        inherited_entries =
+            inherited_entries
+                .checked_add(missing)
+                .ok_or(ConfigError::LimitExceeded {
+                    resource: "environment entries",
+                    limit: MAX_TOTAL_ENV_ENTRIES,
+                })?;
+        for (key, value) in &environment {
+            if !service.environment.contains_key(key) {
+                inherited_bytes = inherited_bytes
+                    .checked_add(key.len())
+                    .and_then(|bytes| bytes.checked_add(value.len()))
+                    .ok_or(ConfigError::LimitExceeded {
+                        resource: "parsed string bytes",
+                        limit: MAX_CONFIG_ALLOCATED_BYTES,
+                    })?;
+            }
+        }
+    }
+    ConfigBudget::reserve_count(
+        &mut budget.env_entries,
+        inherited_entries,
+        MAX_TOTAL_ENV_ENTRIES,
+        "environment entries",
+    )?;
+    budget.reserve_bytes(inherited_bytes, "parsed string bytes")?;
     for service in services.values_mut() {
         for (key, value) in &environment {
-            service
-                .environment
-                .entry(key.clone())
-                .or_insert_with(|| value.clone());
+            if !service.environment.contains_key(key) {
+                service.environment.insert(key.clone(), value.clone());
+            }
         }
     }
     if let Some(shell) = &boot.shell {
@@ -591,6 +882,12 @@ fn default_service() -> ServiceConfig {
 }
 
 fn validate_name(name: &str) -> Result<(), ConfigError> {
+    if name.len() > MAX_SERVICE_NAME_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "service name bytes",
+            limit: MAX_SERVICE_NAME_BYTES,
+        });
+    }
     let mut chars = name.bytes();
     if !chars.next().is_some_and(|byte| byte.is_ascii_lowercase()) {
         return Err(ConfigError::InvalidValue(format!("service name {name}")));
@@ -619,6 +916,12 @@ fn validate_boot_service(
 }
 
 fn validate_env_name(name: &str) -> Result<(), ConfigError> {
+    if name.len() > MAX_ENV_NAME_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "environment name bytes",
+            limit: MAX_ENV_NAME_BYTES,
+        });
+    }
     let mut bytes = name.bytes();
     if !bytes
         .next()
@@ -631,6 +934,12 @@ fn validate_env_name(name: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_path(path: &str, field: &str) -> Result<(), ConfigError> {
+    if path.len() > MAX_CONFIG_STRING_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "path bytes",
+            limit: MAX_CONFIG_STRING_BYTES,
+        });
+    }
     if !path.starts_with('/') || path.contains('\0') || path.contains('\\') {
         return Err(ConfigError::InvalidValue(format!("{field}={path}")));
     }
@@ -646,6 +955,12 @@ fn validate_path(path: &str, field: &str) -> Result<(), ConfigError> {
 }
 
 fn validate_capabilities(service: &str, capabilities: &[String]) -> Result<(), ConfigError> {
+    if capabilities.len() > MAX_CAPABILITIES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "capabilities",
+            limit: MAX_CAPABILITIES,
+        });
+    }
     let mut seen = BTreeSet::new();
     for capability in capabilities {
         if !seen.insert(capability) {
@@ -653,30 +968,70 @@ fn validate_capabilities(service: &str, capabilities: &[String]) -> Result<(), C
                 "{service}.capabilities duplicate={capability}"
             )));
         }
-        if !matches!(
-            capability.as_str(),
-            "mount" | "raw-io" | "net-admin" | "net-raw" | "memory-map" | "device-admin"
-        ) {
-            return Err(ConfigError::InvalidValue(format!(
-                "{service}.capabilities={capability}"
-            )));
-        }
+        validate_capability_name(capability).map_err(|_| {
+            ConfigError::InvalidValue(format!("{service}.capabilities={capability}"))
+        })?;
     }
     Ok(())
 }
 
-fn parse_string(value: &str) -> Result<String, ConfigError> {
+fn validate_capability_name(name: &str) -> Result<(), ConfigError> {
+    if name.len() > MAX_CAPABILITY_NAME_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "capability name bytes",
+            limit: MAX_CAPABILITY_NAME_BYTES,
+        });
+    }
+    if !matches!(
+        name,
+        "mount" | "raw-io" | "net-admin" | "net-raw" | "memory-map" | "device-admin"
+    ) {
+        return Err(ConfigError::InvalidValue(format!("capability={name}")));
+    }
+    Ok(())
+}
+
+fn validate_any_array_item(_item: &str) -> Result<(), ConfigError> {
+    Ok(())
+}
+
+fn parse_string_ref(value: &str) -> Result<&str, ConfigError> {
+    if value.len() > MAX_CONFIG_LINE_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "source line bytes",
+            limit: MAX_CONFIG_LINE_BYTES,
+        });
+    }
     if value.len() < 2 || !value.starts_with('"') || !value.ends_with('"') {
         return Err(ConfigError::InvalidValue(value.to_owned()));
     }
     let body = &value[1..value.len() - 1];
+    if body.len() > MAX_CONFIG_STRING_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "string bytes",
+            limit: MAX_CONFIG_STRING_BYTES,
+        });
+    }
     if body.contains('\\') {
         return Err(ConfigError::InvalidValue(value.to_owned()));
     }
-    Ok(body.to_owned())
+    Ok(body)
 }
 
-fn parse_array(value: &str) -> Result<Vec<String>, ConfigError> {
+fn parse_array(
+    value: &str,
+    budget: &mut ConfigBudget,
+    maximum_items: usize,
+    maximum_bytes: usize,
+    maximum_item_bytes: usize,
+    item_validator: fn(&str) -> Result<(), ConfigError>,
+) -> Result<Vec<String>, ConfigError> {
+    if value.len() > MAX_CONFIG_LINE_BYTES {
+        return Err(ConfigError::LimitExceeded {
+            resource: "source line bytes",
+            limit: MAX_CONFIG_LINE_BYTES,
+        });
+    }
     if !value.starts_with('[') || !value.ends_with(']') {
         return Err(ConfigError::InvalidValue(value.to_owned()));
     }
@@ -684,9 +1039,50 @@ fn parse_array(value: &str) -> Result<Vec<String>, ConfigError> {
     if body.is_empty() {
         return Ok(Vec::new());
     }
-    body.split(',')
-        .map(|item| parse_string(item.trim()))
-        .collect()
+    if body.len() > maximum_bytes {
+        return Err(ConfigError::LimitExceeded {
+            resource: "array bytes",
+            limit: maximum_bytes,
+        });
+    }
+    let item_count = body.split(',').count();
+    if item_count > maximum_items || item_count > MAX_ARRAY_ITEMS {
+        return Err(ConfigError::LimitExceeded {
+            resource: "array items",
+            limit: maximum_items.min(MAX_ARRAY_ITEMS),
+        });
+    }
+
+    let mut item_bytes = 0usize;
+    for item in body.split(',') {
+        let item = parse_string_ref(item.trim())?;
+        if item.len() > maximum_item_bytes {
+            return Err(ConfigError::LimitExceeded {
+                resource: "array item bytes",
+                limit: maximum_item_bytes,
+            });
+        }
+        item_bytes = item_bytes
+            .checked_add(item.len())
+            .ok_or(ConfigError::LimitExceeded {
+                resource: "array bytes",
+                limit: maximum_bytes,
+            })?;
+        item_validator(item)?;
+    }
+    if item_bytes > maximum_bytes {
+        return Err(ConfigError::LimitExceeded {
+            resource: "array bytes",
+            limit: maximum_bytes,
+        });
+    }
+    budget.reserve_array(item_count, item_bytes)?;
+
+    let mut items = Vec::with_capacity(item_count);
+    for item in body.split(',') {
+        items.push(parse_string_ref(item.trim())?.to_owned());
+    }
+    Ok(items)
 }
 
 fn parse_u32(value: &str) -> Result<u32, ConfigError> {
@@ -733,15 +1129,16 @@ fn parse_bounded_u64(value: &str, field: &str, maximum: u64) -> Result<u64, Conf
     Ok(value)
 }
 
-fn parse_stream(value: &str) -> Result<StreamSpec, ConfigError> {
-    let value = parse_string(value)?;
-    match value.as_str() {
+fn parse_stream(value: &str, budget: &mut ConfigBudget) -> Result<StreamSpec, ConfigError> {
+    let value = parse_string_ref(value)?;
+    match value {
         "inherit" => Ok(StreamSpec::Inherit),
         "null" => Ok(StreamSpec::Null),
         "serial" => Ok(StreamSpec::Serial),
         value if value.starts_with("file:") => {
             let path = &value["file:".len()..];
             validate_path(path, "stream.file")?;
+            budget.reserve_bytes(path.len(), "parsed string bytes")?;
             Ok(StreamSpec::File(path.to_owned()))
         }
         _ => Err(ConfigError::InvalidValue(format!("stream={value}"))),
@@ -807,11 +1204,35 @@ fn detect_cycles(services: &BTreeMap<String, ServiceConfig>) -> Result<(), Confi
 }
 
 pub type ChildHandle = u64;
+pub type ChildGeneration = u64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildProcess {
+    pub handle: ChildHandle,
+    pub generation: ChildGeneration,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChildExit {
     pub code: Option<i32>,
     pub signal: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildExitEvent {
+    pub child: ChildHandle,
+    pub generation: ChildGeneration,
+    pub exit: ChildExit,
+}
+
+impl ChildExitEvent {
+    pub const fn new(child: ChildHandle, generation: ChildGeneration, exit: ChildExit) -> Self {
+        Self {
+            child,
+            generation,
+            exit,
+        }
+    }
 }
 
 impl ChildExit {
@@ -842,6 +1263,7 @@ impl ChildExit {
 pub enum SpawnError {
     Unavailable,
     Invalid(String),
+    Invariant(String),
 }
 
 impl fmt::Display for SpawnError {
@@ -849,6 +1271,7 @@ impl fmt::Display for SpawnError {
         match self {
             Self::Unavailable => formatter.write_str("process backend unavailable"),
             Self::Invalid(value) => write!(formatter, "invalid process request: {value}"),
+            Self::Invariant(value) => write!(formatter, "supervisor invariant violated: {value}"),
         }
     }
 }
@@ -856,9 +1279,16 @@ impl fmt::Display for SpawnError {
 impl std::error::Error for SpawnError {}
 
 pub trait ProcessBackend {
-    fn spawn(&mut self, name: &str, config: &ServiceConfig) -> Result<ChildHandle, SpawnError>;
-    fn signal(&mut self, child: ChildHandle, signal: Signal) -> Result<(), SpawnError>;
-    fn poll(&mut self) -> Vec<(ChildHandle, ChildExit)>;
+    /// `generation` is the supervisor-owned epoch for this service launch.
+    /// The backend must return it unchanged in the corresponding exit event.
+    fn spawn(
+        &mut self,
+        name: &str,
+        config: &ServiceConfig,
+        generation: ChildGeneration,
+    ) -> Result<ChildHandle, SpawnError>;
+    fn signal(&mut self, child: ChildProcess, signal: Signal) -> Result<(), SpawnError>;
+    fn poll(&mut self) -> Vec<ChildExitEvent>;
 
     fn reap_orphans(&mut self) -> u32 {
         0
@@ -872,6 +1302,7 @@ pub enum ServiceState {
     Ready,
     Running,
     Stopping,
+    Killing,
     Backoff,
     Stopped,
     Completed,
@@ -927,15 +1358,13 @@ pub struct ExitCause {
 #[derive(Debug, Clone)]
 struct ServiceRuntime {
     state: ServiceState,
-    child: Option<ChildHandle>,
+    child: Option<ChildProcess>,
+    generation: ChildGeneration,
     started_at_ms: u64,
     restart_count: u32,
     next_start_ms: u64,
     last_exit: Option<ExitCause>,
-    stop_reason: Option<StopReason>,
-    stop_deadline_ms: Option<u64>,
-    stop_escalated: bool,
-    restart_after_stop: bool,
+    stop: Option<StopRequest>,
 }
 
 impl Default for ServiceRuntime {
@@ -943,14 +1372,12 @@ impl Default for ServiceRuntime {
         Self {
             state: ServiceState::Defined,
             child: None,
+            generation: 0,
             started_at_ms: 0,
             restart_count: 0,
             next_start_ms: 0,
             last_exit: None,
-            stop_reason: None,
-            stop_deadline_ms: None,
-            stop_escalated: false,
-            restart_after_stop: false,
+            stop: None,
         }
     }
 }
@@ -1038,6 +1465,25 @@ impl Supervisor {
         self.storage_available = available;
     }
 
+    fn service_config(&self, name: &str) -> Result<&ServiceConfig, SpawnError> {
+        self.config
+            .services
+            .get(name)
+            .ok_or_else(|| SpawnError::Invariant(format!("service {name} has no configuration")))
+    }
+
+    fn runtime(&self, name: &str) -> Result<&ServiceRuntime, SpawnError> {
+        self.services
+            .get(name)
+            .ok_or_else(|| SpawnError::Invariant(format!("service {name} has no runtime")))
+    }
+
+    fn runtime_mut(&mut self, name: &str) -> Result<&mut ServiceRuntime, SpawnError> {
+        self.services
+            .get_mut(name)
+            .ok_or_else(|| SpawnError::Invariant(format!("service {name} has no runtime")))
+    }
+
     pub fn boot_ready(&self) -> bool {
         self.storage_available
             && self
@@ -1048,10 +1494,12 @@ impl Supervisor {
                 .chain(&self.config.boot.devices)
                 .chain(&self.config.boot.logging)
                 .all(|name| {
-                    matches!(
-                        self.services[name].state,
-                        ServiceState::Ready | ServiceState::Running | ServiceState::Completed
-                    )
+                    self.services.get(name).is_some_and(|runtime| {
+                        matches!(
+                            runtime.state,
+                            ServiceState::Ready | ServiceState::Running | ServiceState::Completed
+                        )
+                    })
                 })
     }
 
@@ -1113,40 +1561,47 @@ impl Supervisor {
     ) -> Result<(), SpawnError> {
         self.now_ms = now_ms;
         let exits = backend.poll();
-        for (child, exit) in exits {
-            let Some(name) = self
-                .services
-                .iter()
-                .find_map(|(name, runtime)| (runtime.child == Some(child)).then_some(name.clone()))
-            else {
+        for event in exits {
+            let Some(name) = self.services.iter().find_map(|(name, runtime)| {
+                runtime
+                    .child
+                    .is_some_and(|child| {
+                        child.handle == event.child && child.generation == event.generation
+                    })
+                    .then_some(name.clone())
+            }) else {
+                let stale = self.services.values().any(|runtime| {
+                    runtime
+                        .child
+                        .is_some_and(|child| child.handle == event.child)
+                        || (event.generation != 0 && runtime.generation > event.generation)
+                });
                 self.record(
                     "init",
                     LogLevel::Debug,
-                    "orphan-exit",
+                    if stale { "stale-exit" } else { "orphan-exit" },
                     format!(
-                        "child={child} code={:?} signal={:?}",
-                        exit.code, exit.signal
+                        "child={};generation={};code={:?};signal={:?}",
+                        event.child, event.generation, event.exit.code, event.exit.signal
                     ),
                 );
                 continue;
             };
 
-            let config = self.config.services[&name].clone();
+            let config = self.service_config(&name)?.clone();
             let mut queue_restart = false;
             let event = {
-                let runtime = self.services.get_mut(&name).expect("service was found");
+                let runtime = self.runtime_mut(&name)?;
                 runtime.child = None;
                 runtime.last_exit = Some(ExitCause {
-                    code: exit.code,
-                    signal: exit.signal,
+                    code: event.exit.code,
+                    signal: event.exit.signal,
                 });
-                let stop_reason = runtime.stop_reason.take();
-                let restart_after_stop = runtime.restart_after_stop;
-                runtime.restart_after_stop = false;
-                runtime.stop_deadline_ms = None;
-                runtime.stop_escalated = false;
-                let failed = !exit.is_success();
-                if stop_reason == Some(StopReason::Manual) && restart_after_stop {
+                let stop = runtime.stop.take();
+                let restart_after_reap = stop.is_some_and(|stop| stop.restart_after_reap);
+                let stop_reason = stop.map(|stop| stop.reason);
+                let failed = !event.exit.is_success();
+                if stop_reason == Some(StopReason::Manual) && restart_after_reap {
                     runtime.state = ServiceState::Defined;
                     runtime.next_start_ms = now_ms;
                     queue_restart = true;
@@ -1154,14 +1609,17 @@ impl Supervisor {
                         LogLevel::Notice,
                         format!(
                             "stopped;restart queued;code={:?};signal={:?}",
-                            exit.code, exit.signal
+                            event.exit.code, event.exit.signal
                         ),
                     ))
                 } else if stop_reason == Some(StopReason::Manual) {
                     runtime.state = ServiceState::Stopped;
                     Some((
                         LogLevel::Notice,
-                        format!("manual-stop;code={:?};signal={:?}", exit.code, exit.signal),
+                        format!(
+                            "manual-stop;code={:?};signal={:?}",
+                            event.exit.code, event.exit.signal
+                        ),
                     ))
                 } else if stop_reason == Some(StopReason::Timeout)
                     && config.timeout_action == TimeoutAction::Stop
@@ -1169,7 +1627,10 @@ impl Supervisor {
                     runtime.state = ServiceState::Stopped;
                     Some((
                         LogLevel::Warn,
-                        format!("timeout-stop;code={:?};signal={:?}", exit.code, exit.signal),
+                        format!(
+                            "timeout-stop;code={:?};signal={:?}",
+                            event.exit.code, event.exit.signal
+                        ),
                     ))
                 } else if stop_reason == Some(StopReason::Timeout)
                     && config.timeout_action == TimeoutAction::Fail
@@ -1179,10 +1640,10 @@ impl Supervisor {
                         LogLevel::Error,
                         format!(
                             "timeout-failed;code={:?};signal={:?}",
-                            exit.code, exit.signal
+                            event.exit.code, event.exit.signal
                         ),
                     ))
-                } else if config.kind == ServiceKind::Oneshot && exit.is_success() {
+                } else if config.kind == ServiceKind::Oneshot && event.exit.is_success() {
                     runtime.state = ServiceState::Completed;
                     Some((LogLevel::Notice, "completed".to_owned()))
                 } else {
@@ -1192,26 +1653,38 @@ impl Supervisor {
                         RestartPolicy::Always => true,
                     };
                     if should_restart && runtime.restart_count < config.max_restarts {
-                        runtime.restart_count += 1;
-                        runtime.next_start_ms = now_ms + backoff_ms(runtime.restart_count);
-                        runtime.state = ServiceState::Backoff;
-                        Some((
-                            LogLevel::Warn,
-                            format!(
-                                "exit=code:{:?},signal:{:?};restart={} at={}",
-                                exit.code,
-                                exit.signal,
-                                runtime.restart_count,
-                                runtime.next_start_ms
-                            ),
-                        ))
+                        let attempt = runtime.restart_count + 1;
+                        if let Some(next_start_ms) = now_ms.checked_add(backoff_ms(attempt)) {
+                            runtime.restart_count = attempt;
+                            runtime.next_start_ms = next_start_ms;
+                            runtime.state = ServiceState::Backoff;
+                            Some((
+                                LogLevel::Warn,
+                                format!(
+                                    "exit=code:{:?},signal:{:?};restart={} at={}",
+                                    event.exit.code,
+                                    event.exit.signal,
+                                    runtime.restart_count,
+                                    runtime.next_start_ms
+                                ),
+                            ))
+                        } else {
+                            runtime.state = ServiceState::Failed;
+                            Some((
+                                LogLevel::Error,
+                                format!(
+                                    "exit=code:{:?},signal:{:?};restart-deadline-overflow",
+                                    event.exit.code, event.exit.signal
+                                ),
+                            ))
+                        }
                     } else if should_restart {
                         runtime.state = ServiceState::Failed;
                         Some((
                             LogLevel::Error,
                             format!(
                                 "exit=code:{:?},signal:{:?};restart-limit={}",
-                                exit.code, exit.signal, config.max_restarts
+                                event.exit.code, event.exit.signal, config.max_restarts
                             ),
                         ))
                     } else {
@@ -1226,7 +1699,10 @@ impl Supervisor {
                             } else {
                                 LogLevel::Notice
                             },
-                            format!("exit=code:{:?},signal:{:?}", exit.code, exit.signal),
+                            format!(
+                                "exit=code:{:?},signal:{:?}",
+                                event.exit.code, event.exit.signal
+                            ),
                         ))
                     }
                 }
@@ -1279,19 +1755,26 @@ impl Supervisor {
         }
 
         let mut names: Vec<String> = self.services.keys().cloned().collect();
-        names.sort_by_key(|name| (self.config.services[name].order, name.clone()));
+        names.sort_by_key(|name| {
+            self.config
+                .services
+                .get(name)
+                .map_or((u32::MAX, name.clone()), |config| {
+                    (config.order, name.clone())
+                })
+        });
         for name in names {
+            let config = self.service_config(&name)?.clone();
             if self.config.boot.shell.as_deref() == Some(name.as_str()) && !self.boot_ready() {
                 continue;
             }
-            if !self.config.services[&name].autostart && !self.manual_starts.contains(&name) {
+            if !config.autostart && !self.manual_starts.contains(&name) {
                 continue;
             }
-            if !self.can_start(&name) {
-                if self.dependencies_failed(&name) {
-                    let changed = self.services[&name].state != ServiceState::Blocked;
-                    self.services.get_mut(&name).expect("service exists").state =
-                        ServiceState::Blocked;
+            if !self.can_start(&name)? {
+                if self.dependencies_failed(&name)? {
+                    let changed = self.runtime(&name)?.state != ServiceState::Blocked;
+                    self.runtime_mut(&name)?.state = ServiceState::Blocked;
                     if changed {
                         self.record(
                             &name,
@@ -1303,30 +1786,45 @@ impl Supervisor {
                 }
                 continue;
             }
-            if self.services[&name].child.is_some()
+            let runtime = self.runtime(&name)?;
+            if runtime.child.is_some()
                 || matches!(
-                    self.services[&name].state,
+                    runtime.state,
                     ServiceState::Failed
                         | ServiceState::Stopped
                         | ServiceState::Completed
                         | ServiceState::Blocked
+                        | ServiceState::Killing
                 )
-                || now_ms < self.services[&name].next_start_ms
+                || now_ms < runtime.next_start_ms
             {
                 continue;
             }
 
-            let config = self.config.services[&name].clone();
-            let spawn_result = backend.spawn(&name, &config);
+            let generation = match runtime.generation.checked_add(1) {
+                Some(generation) => generation,
+                None => {
+                    self.runtime_mut(&name)?.state = ServiceState::Failed;
+                    self.record(
+                        &name,
+                        LogLevel::Error,
+                        "start",
+                        "child-generation-overflow".to_owned(),
+                    );
+                    continue;
+                }
+            };
+            let spawn_result = backend.spawn(&name, &config, generation);
             let event = match spawn_result {
                 Ok(child) => {
-                    let runtime = self.services.get_mut(&name).expect("service exists");
-                    runtime.child = Some(child);
+                    let runtime = self.runtime_mut(&name)?;
+                    runtime.child = Some(ChildProcess {
+                        handle: child,
+                        generation,
+                    });
+                    runtime.generation = generation;
                     runtime.started_at_ms = now_ms;
-                    runtime.stop_reason = None;
-                    runtime.stop_deadline_ms = None;
-                    runtime.stop_escalated = false;
-                    runtime.restart_after_stop = false;
+                    runtime.stop = None;
                     runtime.state = match config.readiness {
                         Readiness::Spawn => ServiceState::Running,
                         Readiness::Notify => ServiceState::Starting,
@@ -1337,7 +1835,7 @@ impl Supervisor {
                     ))
                 }
                 Err(error) => {
-                    let runtime = self.services.get_mut(&name).expect("service exists");
+                    let runtime = self.runtime_mut(&name)?;
                     runtime.last_exit = None;
                     runtime.state = ServiceState::Failed;
                     Some((LogLevel::Error, error.to_string()))
@@ -1348,64 +1846,75 @@ impl Supervisor {
             }
         }
 
-        let stop_actions: Vec<(String, ChildHandle, Signal, bool, bool)> = self
-            .services
-            .iter()
-            .filter_map(|(name, runtime)| {
-                if runtime.state == ServiceState::Starting {
-                    let timeout = self.config.services[name].readiness_timeout_ms;
-                    return (timeout != 0
-                        && now_ms.saturating_sub(runtime.started_at_ms) >= timeout)
-                        .then_some((
-                            name.clone(),
-                            runtime.child?,
-                            self.config.services[name].stop_signal,
-                            true,
-                            true,
-                        ));
-                }
-                if runtime.state == ServiceState::Stopping {
-                    return (runtime
-                        .stop_deadline_ms
-                        .is_some_and(|deadline| now_ms >= deadline)
-                        && !runtime.stop_escalated)
-                        .then_some((
-                            name.clone(),
-                            runtime.child?,
-                            self.config.services[name].kill_signal,
-                            false,
-                            false,
-                        ));
-                }
-                let timeout = self.config.services[name].timeout_ms;
-                if timeout == 0
-                    || now_ms.saturating_sub(runtime.started_at_ms) < timeout
-                    || !matches!(runtime.state, ServiceState::Ready | ServiceState::Running)
+        let mut stop_actions = Vec::new();
+        for (name, runtime) in &self.services {
+            let config = self.service_config(name)?;
+            if runtime.state == ServiceState::Starting {
+                if config.readiness_timeout_ms != 0
+                    && now_ms.saturating_sub(runtime.started_at_ms) >= config.readiness_timeout_ms
                 {
-                    return None;
+                    if let Some(child) = runtime.child {
+                        stop_actions.push((name.clone(), child, config.stop_signal, true, true));
+                    }
                 }
-                runtime.child.map(|child| {
-                    (
-                        name.clone(),
-                        child,
-                        self.config.services[name].stop_signal,
-                        true,
-                        false,
-                    )
-                })
-            })
-            .collect();
-        for (name, child, signal, begin_stop, readiness_timeout) in stop_actions {
-            backend.signal(child, signal)?;
-            let runtime = self.services.get_mut(&name).expect("service exists");
-            if begin_stop {
-                runtime.state = ServiceState::Stopping;
-                runtime.stop_reason = Some(StopReason::Timeout);
-                runtime.stop_deadline_ms =
-                    Some(now_ms.saturating_add(self.config.services[&name].stop_timeout_ms));
-                runtime.stop_escalated = false;
+                continue;
+            }
+            if runtime.state == ServiceState::Stopping {
+                if let Some(StopRequest {
+                    phase: StopPhase::Graceful { deadline_ms },
+                    ..
+                }) = runtime.stop
+                {
+                    if now_ms >= deadline_ms {
+                        if let Some(child) = runtime.child {
+                            stop_actions.push((
+                                name.clone(),
+                                child,
+                                config.kill_signal,
+                                false,
+                                false,
+                            ));
+                        }
+                    }
+                }
+                continue;
+            }
+            if config.timeout_ms != 0
+                && now_ms.saturating_sub(runtime.started_at_ms) >= config.timeout_ms
+                && matches!(runtime.state, ServiceState::Ready | ServiceState::Running)
+            {
+                if let Some(child) = runtime.child {
+                    stop_actions.push((name.clone(), child, config.stop_signal, true, false));
+                }
+            }
+        }
+        for (name, child, configured_signal, begin_stop, readiness_timeout) in stop_actions {
+            let config = self.service_config(&name)?.clone();
+            let (signal, phase) = if begin_stop {
+                match now_ms.checked_add(config.stop_timeout_ms) {
+                    Some(deadline_ms) => (configured_signal, StopPhase::Graceful { deadline_ms }),
+                    None => (config.kill_signal, StopPhase::KillSent),
+                }
             } else {
-                runtime.stop_escalated = true;
+                (configured_signal, StopPhase::KillSent)
+            };
+            backend.signal(child, signal)?;
+            let runtime = self.runtime_mut(&name)?;
+            if begin_stop {
+                runtime.stop = Some(StopRequest {
+                    reason: StopReason::Timeout,
+                    phase,
+                    restart_after_reap: false,
+                });
+                runtime.state = match phase {
+                    StopPhase::Graceful { .. } => ServiceState::Stopping,
+                    StopPhase::KillSent => ServiceState::Killing,
+                };
+            } else {
+                if let Some(stop) = runtime.stop.as_mut() {
+                    stop.phase = StopPhase::KillSent;
+                }
+                runtime.state = ServiceState::Killing;
             }
             self.record(
                 &name,
@@ -1419,7 +1928,10 @@ impl Supervisor {
                 } else {
                     "stop-timeout"
                 },
-                format!("child={child};signal={signal:?}"),
+                format!(
+                    "child={};generation={};signal={signal:?}",
+                    child.handle, child.generation
+                ),
             );
         }
         Ok(())
@@ -1435,28 +1947,87 @@ impl Supervisor {
             .get(name)
             .ok_or_else(|| SpawnError::Invalid(format!("unknown service {name}")))?;
         let child = runtime.child;
-        let already_stopping = runtime.state == ServiceState::Stopping;
-        let stop_signal = self.config.services[name].stop_signal;
-        let stop_timeout_ms = self.config.services[name].stop_timeout_ms;
-        if already_stopping {
+        let current_stop = runtime.stop;
+        let config = self.service_config(name)?.clone();
+        let stop_signal = config.stop_signal;
+        let kill_signal = config.kill_signal;
+        let stop_timeout_ms = config.stop_timeout_ms;
+        let Some(child) = child else {
+            self.manual_starts.remove(name);
+            let runtime = self.runtime_mut(name)?;
+            runtime.state = ServiceState::Stopped;
+            runtime.stop = None;
+            self.record(name, LogLevel::Notice, "stop", "requested".to_owned());
+            return Ok(());
+        };
+
+        if let Some(stop) = current_stop {
+            if stop.phase == StopPhase::KillSent {
+                self.manual_starts.remove(name);
+                let runtime = self.runtime_mut(name)?;
+                runtime.stop = Some(StopRequest {
+                    reason: StopReason::Manual,
+                    phase: StopPhase::KillSent,
+                    restart_after_reap: false,
+                });
+                self.record(name, LogLevel::Notice, "stop", "requested".to_owned());
+                return Ok(());
+            }
+
+            let phase = match self.now_ms.checked_add(stop_timeout_ms) {
+                Some(deadline_ms) => StopPhase::Graceful { deadline_ms },
+                None => StopPhase::KillSent,
+            };
+            if let StopPhase::Graceful { .. } = phase {
+                self.manual_starts.remove(name);
+                let runtime = self.runtime_mut(name)?;
+                runtime.stop = Some(StopRequest {
+                    reason: StopReason::Manual,
+                    phase,
+                    restart_after_reap: false,
+                });
+                self.record(name, LogLevel::Notice, "stop", "requested".to_owned());
+                return Ok(());
+            }
+
+            backend.signal(child, kill_signal)?;
+            self.manual_starts.remove(name);
+            let runtime = self.runtime_mut(name)?;
+            runtime.state = ServiceState::Killing;
+            runtime.stop = Some(StopRequest {
+                reason: StopReason::Manual,
+                phase: StopPhase::KillSent,
+                restart_after_reap: false,
+            });
+            self.record(
+                name,
+                LogLevel::Notice,
+                "stop",
+                "requested;signal=kill".to_owned(),
+            );
             return Ok(());
         }
-        if let Some(child) = child {
-            backend.signal(child, stop_signal)?;
-        }
+
+        let phase = match self.now_ms.checked_add(stop_timeout_ms) {
+            Some(deadline_ms) => StopPhase::Graceful { deadline_ms },
+            None => StopPhase::KillSent,
+        };
+        let signal = match phase {
+            StopPhase::Graceful { .. } => stop_signal,
+            StopPhase::KillSent => kill_signal,
+        };
+        backend.signal(child, signal)?;
         self.manual_starts.remove(name);
-        let runtime = self.services.get_mut(name).expect("service was checked");
-        runtime.restart_after_stop = false;
-        runtime.stop_escalated = false;
-        if child.is_some() {
-            runtime.state = ServiceState::Stopping;
-            runtime.stop_reason = Some(StopReason::Manual);
-            runtime.stop_deadline_ms = Some(self.now_ms.saturating_add(stop_timeout_ms));
-        } else {
-            runtime.state = ServiceState::Stopped;
-            runtime.stop_reason = None;
-            runtime.stop_deadline_ms = None;
-        }
+        let runtime = self.runtime_mut(name)?;
+        runtime.state = match phase {
+            StopPhase::Graceful { .. } => ServiceState::Stopping,
+            StopPhase::KillSent => ServiceState::Killing,
+        };
+        runtime.stop = Some(StopRequest {
+            reason: StopReason::Manual,
+            phase,
+            restart_after_reap: false,
+        });
         self.record(name, LogLevel::Notice, "stop", "requested".to_owned());
         Ok(())
     }
@@ -1474,11 +2045,16 @@ impl Supervisor {
             .is_some();
         self.stop(backend, name)?;
         self.manual_starts.insert(name.to_owned());
-        let runtime = self.services.get_mut(name).expect("service was checked");
+        let now_ms = self.now_ms;
+        let runtime = self.runtime_mut(name)?;
         runtime.restart_count = 0;
-        runtime.next_start_ms = self.now_ms;
-        runtime.restart_after_stop = had_child;
-        if !had_child {
+        runtime.next_start_ms = now_ms;
+        if had_child {
+            if let Some(stop) = runtime.stop.as_mut() {
+                stop.reason = StopReason::Manual;
+                stop.restart_after_reap = true;
+            }
+        } else {
             runtime.state = ServiceState::Defined;
         }
         self.record(name, LogLevel::Notice, "restart", "queued".to_owned());
@@ -1497,6 +2073,7 @@ impl Supervisor {
                     | ServiceState::Ready
                     | ServiceState::Running
                     | ServiceState::Stopping
+                    | ServiceState::Killing
             )
         {
             return Err(SpawnError::Invalid(format!(
@@ -1504,9 +2081,10 @@ impl Supervisor {
             )));
         }
         self.manual_starts.insert(name.to_owned());
-        let runtime = self.services.get_mut(name).expect("service was checked");
+        let now_ms = self.now_ms;
+        let runtime = self.runtime_mut(name)?;
         runtime.state = ServiceState::Defined;
-        runtime.next_start_ms = self.now_ms;
+        runtime.next_start_ms = now_ms;
         runtime.restart_count = 0;
         self.record(name, LogLevel::Notice, "start", "queued".to_owned());
         Ok(())
@@ -1517,7 +2095,7 @@ impl Supervisor {
         backend: &mut B,
         signal: Signal,
     ) -> Result<(), SpawnError> {
-        let children: Vec<(String, ChildHandle)> = self
+        let children: Vec<(String, ChildProcess)> = self
             .services
             .iter()
             .filter_map(|(name, runtime)| runtime.child.map(|child| (name.clone(), child)))
@@ -1529,14 +2107,20 @@ impl Supervisor {
                     &name,
                     LogLevel::Debug,
                     "signal",
-                    format!("child={child};signal={signal:?}"),
+                    format!(
+                        "child={};generation={};signal={signal:?}",
+                        child.handle, child.generation
+                    ),
                 ),
                 Err(error) => {
                     self.record(
                         &name,
                         LogLevel::Error,
                         "signal-failed",
-                        format!("child={child};signal={signal:?};error={error}"),
+                        format!(
+                            "child={};generation={};signal={signal:?};error={error}",
+                            child.handle, child.generation
+                        ),
                     );
                     first_error.get_or_insert(error);
                 }
@@ -1589,28 +2173,26 @@ impl Supervisor {
         &self.config.shutdown
     }
 
-    fn can_start(&self, name: &str) -> bool {
-        self.config.services[name]
-            .dependencies
-            .iter()
-            .all(|dependency| {
-                matches!(
-                    self.services[dependency].state,
+    fn can_start(&self, name: &str) -> Result<bool, SpawnError> {
+        let config = self.service_config(name)?;
+        config.dependencies.iter().try_fold(true, |ready, dependency| {
+            Ok(ready
+                && matches!(
+                    self.runtime(dependency)?.state,
                     ServiceState::Ready | ServiceState::Running | ServiceState::Completed
-                )
-            })
+                ))
+        })
     }
 
-    fn dependencies_failed(&self, name: &str) -> bool {
-        self.config.services[name]
-            .dependencies
-            .iter()
-            .any(|dependency| {
-                matches!(
-                    self.services[dependency].state,
+    fn dependencies_failed(&self, name: &str) -> Result<bool, SpawnError> {
+        let config = self.service_config(name)?;
+        config.dependencies.iter().try_fold(false, |failed, dependency| {
+            Ok(failed
+                || matches!(
+                    self.runtime(dependency)?.state,
                     ServiceState::Failed | ServiceState::Blocked | ServiceState::Stopped
-                )
-            })
+                ))
+        })
     }
 
     fn record(&mut self, service: &str, level: LogLevel, event: &str, detail: String) {
@@ -1739,16 +2321,26 @@ pub fn execute_command<B: ProcessBackend>(
         }
         Command::Stop(name) => {
             supervisor.stop(backend, &name)?;
+            let state = supervisor.state(&name).ok_or_else(|| {
+                ControlError::Backend(SpawnError::Invariant(format!(
+                    "stopped service {name} has no runtime"
+                )))
+            })?;
             format!(
                 "stop service={name} state={:?}",
-                supervisor.state(&name).expect("service was checked")
+                state
             )
         }
         Command::Restart(name) => {
             supervisor.restart(backend, &name)?;
+            let state = supervisor.state(&name).ok_or_else(|| {
+                ControlError::Backend(SpawnError::Invariant(format!(
+                    "restarted service {name} has no runtime"
+                )))
+            })?;
             format!(
                 "restart service={name} state={:?}",
-                supervisor.state(&name).expect("service was checked")
+                state
             )
         }
         Command::LogLevel(level) => {
@@ -1898,11 +2490,193 @@ mod tests {
         ));
     }
 
+    fn quoted_items(prefix: &str, count: usize) -> String {
+        let mut value = String::from("[");
+        for index in 0..count {
+            if index != 0 {
+                value.push_str(", ");
+            }
+            value.push('"');
+            value.push_str(prefix);
+            value.push_str(&index.to_string());
+            value.push('"');
+        }
+        value.push(']');
+        value
+    }
+
+    #[test]
+    fn rejects_memory_dos_corpus_with_bounded_errors() {
+        let oversized_source = "x".repeat(MAX_CONFIG_BYTES + 1);
+        assert_eq!(
+            parse_config(&oversized_source),
+            Err(ConfigError::LimitExceeded {
+                resource: "source bytes",
+                limit: MAX_CONFIG_BYTES,
+            })
+        );
+
+        let oversized_line = format!(
+            "[init]\nversion = 1\n#{}",
+            "x".repeat(MAX_CONFIG_LINE_BYTES)
+        );
+        assert_eq!(
+            parse_config(&oversized_line),
+            Err(ConfigError::LimitExceeded {
+                resource: "source line bytes",
+                limit: MAX_CONFIG_LINE_BYTES,
+            })
+        );
+
+        let too_many_lines = format!("[init]\nversion = 1\n{}", "#\n".repeat(MAX_CONFIG_LINES));
+        assert_eq!(
+            parse_config(&too_many_lines),
+            Err(ConfigError::LimitExceeded {
+                resource: "source lines",
+                limit: MAX_CONFIG_LINES,
+            })
+        );
+
+        let mut too_many_services = String::from("[init]\nversion = 1\n");
+        for index in 0..=MAX_SERVICES {
+            too_many_services.push_str(&format!("[service.s{index}]\ncommand = \"/bin/s\"\n"));
+        }
+        assert!(matches!(
+            parse_config(&too_many_services),
+            Err(ConfigError::LimitExceeded {
+                resource: "services",
+                limit: MAX_SERVICES,
+            })
+        ));
+
+        let too_many_args = format!(
+            "[init]\nversion = 1\n[service.app]\ncommand = \"/bin/app\"\nargs = {}\n",
+            quoted_items("arg", MAX_ARGUMENTS + 1)
+        );
+        assert!(matches!(
+            parse_config(&too_many_args),
+            Err(ConfigError::LimitExceeded {
+                resource: "array items",
+                limit: MAX_ARGUMENTS,
+            })
+        ));
+
+        let too_many_dependencies = format!(
+            "[init]\nversion = 1\n[service.app]\ncommand = \"/bin/app\"\ndependencies = {}\n",
+            quoted_items("dep", MAX_DEPENDENCIES + 1)
+        );
+        assert!(matches!(
+            parse_config(&too_many_dependencies),
+            Err(ConfigError::LimitExceeded {
+                resource: "array items",
+                limit: MAX_DEPENDENCIES,
+            })
+        ));
+
+        let too_many_capabilities = format!(
+            "[init]\nversion = 1\n[service.app]\ncommand = \"/bin/app\"\ncapabilities = {}\n",
+            "[\"mount\", \"raw-io\", \"net-admin\", \"net-raw\", \"memory-map\", \"device-admin\", \"mount\"]"
+        );
+        assert!(matches!(
+            parse_config(&too_many_capabilities),
+            Err(ConfigError::LimitExceeded {
+                resource: "array items",
+                limit: MAX_CAPABILITIES,
+            })
+        ));
+
+        let oversized_argument = format!(
+            "[init]\nversion = 1\n[service.app]\ncommand = \"/bin/app\"\nargs = [\"{}\"]\n",
+            "x".repeat(MAX_ARGUMENT_BYTES_PER_ITEM + 1)
+        );
+        assert!(matches!(
+            parse_config(&oversized_argument),
+            Err(ConfigError::LimitExceeded {
+                resource: "array item bytes",
+                limit: MAX_ARGUMENT_BYTES_PER_ITEM,
+            })
+        ));
+
+        let oversized_string = format!(
+            "[init]\nversion = 1\n[service.app]\ncommand = \"/{}\"\n",
+            "x".repeat(MAX_CONFIG_STRING_BYTES)
+        );
+        assert!(matches!(
+            parse_config(&oversized_string),
+            Err(ConfigError::LimitExceeded {
+                resource: "string bytes",
+                limit: MAX_CONFIG_STRING_BYTES,
+            })
+        ));
+
+        let mut too_many_global_environment = String::from("[init]\nversion = 1\n[env]\n");
+        for index in 0..=MAX_GLOBAL_ENV_ENTRIES {
+            too_many_global_environment.push_str(&format!("KEY{index} = \"x\"\n"));
+        }
+        assert!(matches!(
+            parse_config(&too_many_global_environment),
+            Err(ConfigError::LimitExceeded {
+                resource: "global environment entries",
+                limit: MAX_GLOBAL_ENV_ENTRIES,
+            })
+        ));
+
+        let mut inherited_budget = String::from("[init]\nversion = 1\n[env]\n");
+        for index in 0..16 {
+            inherited_budget.push_str(&format!("KEY{index} = \"{}\"\n", "x".repeat(800)));
+        }
+        for index in 0..MAX_SERVICES {
+            inherited_budget.push_str(&format!("[service.s{index}]\ncommand = \"/bin/s\"\n"));
+        }
+        assert!(matches!(
+            parse_config(&inherited_budget),
+            Err(ConfigError::LimitExceeded {
+                resource: "parsed string bytes",
+                limit: MAX_CONFIG_ALLOCATED_BYTES,
+            })
+        ));
+    }
+
+    #[test]
+    fn accepts_count_limits_at_the_boundary() {
+        let mut source = String::from("[init]\nversion = 1\n[service.app]\ncommand = \"/bin/app\"\nargs = ");
+        source.push_str(&quoted_items("x", MAX_ARGUMENTS));
+        for index in 0..MAX_SERVICES - 1 {
+            source.push_str(&format!(
+                "\n[service.s{index}]\ncommand = \"/bin/s\""
+            ));
+        }
+
+        let config = parse_config(&source).expect("maximum bounded counts should parse");
+        assert_eq!(config.services.len(), MAX_SERVICES);
+        assert_eq!(config.services["app"].args.len(), MAX_ARGUMENTS);
+    }
+
+    #[test]
+    fn malformed_config_corpus_never_panics() {
+        let corpus = [
+            "",
+            "[",
+            "]",
+            "[service.",
+            "[service.a.env]\nKEY = [",
+            "[service.a]\ncommand = [\"unterminated",
+            "[service.a]\nargs = [\"a\",,\"b\"]",
+            "[service.a]\ncapabilities = [\"not-a-capability\"]",
+            "[env]\nA = \"\\\\\"",
+            "[init]\nversion = 18446744073709551616",
+        ];
+        for source in corpus {
+            let _ = parse_config(source);
+        }
+    }
+
     #[derive(Default)]
     struct FakeBackend {
         next_child: ChildHandle,
         spawned: Vec<String>,
-        pending: VecDeque<(ChildHandle, ChildExit)>,
+        spawned_generations: Vec<ChildGeneration>,
+        pending: VecDeque<ChildExitEvent>,
         signals: Vec<(ChildHandle, Signal)>,
         failed_signals: BTreeSet<ChildHandle>,
         spawn_error: Option<SpawnError>,
@@ -1914,24 +2688,26 @@ mod tests {
             &mut self,
             name: &str,
             _config: &ServiceConfig,
+            generation: ChildGeneration,
         ) -> Result<ChildHandle, SpawnError> {
             if let Some(error) = &self.spawn_error {
                 return Err(error.clone());
             }
             self.next_child += 1;
             self.spawned.push(name.to_owned());
+            self.spawned_generations.push(generation);
             Ok(self.next_child)
         }
 
-        fn signal(&mut self, child: ChildHandle, signal: Signal) -> Result<(), SpawnError> {
-            self.signals.push((child, signal));
-            if self.failed_signals.contains(&child) {
+        fn signal(&mut self, child: ChildProcess, signal: Signal) -> Result<(), SpawnError> {
+            self.signals.push((child.handle, signal));
+            if self.failed_signals.contains(&child.handle) {
                 return Err(SpawnError::Unavailable);
             }
             Ok(())
         }
 
-        fn poll(&mut self) -> Vec<(ChildHandle, ChildExit)> {
+        fn poll(&mut self) -> Vec<ChildExitEvent> {
             self.pending.drain(..).collect()
         }
 
@@ -2130,7 +2906,9 @@ mod tests {
         let mut backend = FakeBackend::default();
         supervisor.tick(&mut backend, 0).expect("tick should work");
         assert_eq!(backend.spawned, vec!["prepare"]);
-        backend.pending.push_back((1, ChildExit::success()));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::success()));
         supervisor.tick(&mut backend, 1).expect("tick should work");
         assert_eq!(supervisor.state("prepare"), Some(ServiceState::Completed));
         assert_eq!(backend.spawned, vec!["prepare", "app"]);
@@ -2156,11 +2934,176 @@ mod tests {
             .stop(&mut backend, "app")
             .expect("stop should work");
         assert_eq!(supervisor.state("app"), Some(ServiceState::Stopping));
-        backend.pending.push_back((1, ChildExit::signal(15)));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(15)));
         supervisor.tick(&mut backend, 1).expect("tick should work");
         assert_eq!(supervisor.state("app"), Some(ServiceState::Stopped));
         supervisor.tick(&mut backend, 2).expect("tick should work");
         assert_eq!(backend.spawned, vec!["app"]);
+    }
+
+    #[test]
+    fn manual_stop_cancels_restart_queued_for_old_child() {
+        let config = parse_config(
+            r#"
+            [init]
+            version = 1
+            [service.app]
+            command = "/bin/app"
+            restart = "always"
+        "#,
+        )
+        .expect("config should parse");
+        let mut supervisor = Supervisor::new(config);
+        let mut backend = FakeBackend::default();
+        supervisor.tick(&mut backend, 0).expect("tick should work");
+        supervisor
+            .restart(&mut backend, "app")
+            .expect("restart should work");
+        supervisor
+            .stop(&mut backend, "app")
+            .expect("stop should cancel restart");
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(15)));
+        supervisor.tick(&mut backend, 1).expect("tick should work");
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Stopped));
+        supervisor.tick(&mut backend, 2).expect("tick should work");
+        assert_eq!(backend.spawned, vec!["app"]);
+    }
+
+    #[test]
+    fn kill_waits_for_matching_reap_before_finalizing_stop() {
+        let config = parse_config(
+            r#"
+            [init]
+            version = 1
+            [service.app]
+            command = "/bin/app"
+            restart = "always"
+            stop_timeout_ms = 10
+        "#,
+        )
+        .expect("config should parse");
+        let mut supervisor = Supervisor::new(config);
+        let mut backend = FakeBackend::default();
+        supervisor.tick(&mut backend, 0).expect("tick should work");
+        supervisor
+            .stop(&mut backend, "app")
+            .expect("stop should work");
+        supervisor.tick(&mut backend, 10).expect("tick should work");
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Killing));
+        assert_eq!(
+            backend.signals,
+            vec![(1, Signal::Terminate), (1, Signal::Kill)]
+        );
+        supervisor.tick(&mut backend, 11).expect("tick should work");
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Killing));
+        assert_eq!(backend.spawned, vec!["app"]);
+
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(9)));
+        supervisor.tick(&mut backend, 12).expect("tick should work");
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Stopped));
+    }
+
+    #[test]
+    fn stale_exit_generation_cannot_finalize_reused_child_handle() {
+        let config = parse_config(
+            r#"
+            [init]
+            version = 1
+            [logging]
+            level = "debug"
+            [service.app]
+            command = "/bin/app"
+            restart = "always"
+        "#,
+        )
+        .expect("config should parse");
+        let mut supervisor = Supervisor::new(config);
+        let mut backend = FakeBackend::default();
+        supervisor.tick(&mut backend, 0).expect("tick should work");
+        supervisor
+            .restart(&mut backend, "app")
+            .expect("restart should work");
+        backend.next_child = 0;
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(15)));
+        supervisor.tick(&mut backend, 1).expect("tick should work");
+        assert_eq!(backend.spawned_generations, vec![1, 2]);
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Running));
+
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::code(99)));
+        supervisor
+            .tick(&mut backend, 2)
+            .expect("stale exit must be ignored");
+        assert_eq!(supervisor.state("app"), Some(ServiceState::Running));
+        assert_eq!(
+            supervisor.last_exit("app"),
+            Some(ExitCause {
+                code: None,
+                signal: Some(15),
+            })
+        );
+        assert!(supervisor.render_logs(Some("init")).contains("stale-exit"));
+    }
+
+    #[test]
+    fn overflowed_deadlines_fail_closed_without_wrapping() {
+        let backoff_config = parse_config(
+            r#"
+            [init]
+            version = 1
+            [service.app]
+            command = "/bin/app"
+            restart = "on-failure"
+            max_restarts = 1
+        "#,
+        )
+        .expect("config should parse");
+        let mut backoff = Supervisor::new(backoff_config);
+        let mut backend = FakeBackend::default();
+        let now = u64::MAX - 100;
+        backoff.tick(&mut backend, now).expect("tick should work");
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::code(1)));
+        backoff
+            .tick(&mut backend, now)
+            .expect("overflow should be handled");
+        assert_eq!(backoff.state("app"), Some(ServiceState::Failed));
+        assert_eq!(backend.spawned, vec!["app"]);
+        assert!(backoff
+            .render_logs(Some("app"))
+            .contains("restart-deadline-overflow"));
+
+        let stop_config = parse_config(
+            r#"
+            [init]
+            version = 1
+            [service.app]
+            command = "/bin/app"
+        "#,
+        )
+        .expect("config should parse");
+        let mut stop = Supervisor::new(stop_config);
+        let mut backend = FakeBackend::default();
+        stop.tick(&mut backend, u64::MAX).expect("tick should work");
+        stop.stop(&mut backend, "app")
+            .expect("overflow should escalate to kill");
+        assert_eq!(stop.state("app"), Some(ServiceState::Killing));
+        assert_eq!(backend.signals, vec![(1, Signal::Kill)]);
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(9)));
+        stop.tick(&mut backend, u64::MAX).expect("tick should work");
+        assert_eq!(stop.state("app"), Some(ServiceState::Stopped));
     }
 
     #[test]
@@ -2206,7 +3149,9 @@ mod tests {
         let mut supervisor = Supervisor::new(config);
         let mut backend = FakeBackend::default();
         supervisor.tick(&mut backend, 0).expect("tick should work");
-        backend.pending.push_back((1, ChildExit::code(1)));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::code(1)));
         supervisor.tick(&mut backend, 1).expect("tick should work");
         assert_eq!(supervisor.state("app"), Some(ServiceState::Backoff));
         assert_eq!(backend.spawned, vec!["app"]);
@@ -2214,7 +3159,9 @@ mod tests {
             .tick(&mut backend, 201)
             .expect("tick should work");
         assert_eq!(backend.spawned, vec!["app", "app"]);
-        backend.pending.push_back((2, ChildExit::signal(9)));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(2, 2, ChildExit::signal(9)));
         supervisor
             .tick(&mut backend, 202)
             .expect("tick should work");
@@ -2460,7 +3407,9 @@ mod tests {
             backend.signals,
             vec![(1, Signal::Terminate), (1, Signal::Hangup)]
         );
-        backend.pending.push_back((1, ChildExit::signal(15)));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(15)));
         supervisor.tick(&mut backend, 16).expect("tick should work");
         assert_eq!(supervisor.state("app"), Some(ServiceState::Failed));
         supervisor.tick(&mut backend, 17).expect("tick should work");
@@ -2562,7 +3511,9 @@ mod tests {
             execute_line(&mut supervisor, &mut backend, "stop app"),
             Ok("stop service=app state=Stopping".to_owned())
         );
-        backend.pending.push_back((1, ChildExit::signal(15)));
+        backend
+            .pending
+            .push_back(ChildExitEvent::new(1, 1, ChildExit::signal(15)));
         supervisor.tick(&mut backend, 2).expect("tick should work");
         assert!(execute_line(&mut supervisor, &mut backend, "start missing").is_err());
     }

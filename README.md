@@ -37,6 +37,14 @@ override them. A daemon must use `readiness = "notify"`; notification keeps a
 service in `Starting` until the supervisor receives `notify_ready`. A oneshot
 that exits successfully becomes `Completed` and unblocks dependents.
 
+The parser applies fixed resource limits before allocating parsed values: the
+source is at most 64 KiB and 1,024 lines (no line over 4 KiB), with at most 128
+services, 64 global environment entries, 128 environment entries per service,
+64 arguments (8 KiB total), 32 dependencies, six capabilities, and 2 KiB per
+stored string. Materialized parsed strings, including inherited environment
+copies, are capped at 256 KiB. Inputs over a limit fail with a deterministic
+limit error and do not start any service.
+
 Manual `stop` enters `Stopping`, forwards the configured stop signal once,
 escalates to the kill signal after `stop_timeout_ms`, and never applies the
 restart policy to that intentional exit. Runtime/readiness timeout uses the
